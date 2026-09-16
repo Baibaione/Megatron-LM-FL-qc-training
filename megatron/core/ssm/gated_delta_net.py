@@ -1065,7 +1065,20 @@ def torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
     )
 
-   
+    # for each chunk
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
         last_recurrent_state = None
     core_attn_out = core_attn_out.reshape(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
