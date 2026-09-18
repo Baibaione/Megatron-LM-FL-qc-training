@@ -1,13 +1,41 @@
 # megatron/plugin/platform/platform_metax.py
+#
+# Deliberately kept byte-identical to platform_cuda.py except for the
+# minimal deltas listed below. The MACA stack reimplements the whole
+# torch.cuda.* API surface (device strings stay 'cuda:x'), so pass-through
+# is the correct implementation; the CUDA fallbacks (pynvml=None memory
+# formula, nvtx hasattr guards) were verified to work on MetaX C550.
+#
+# Intentional deltas vs platform_cuda.py — do not add more without
+# a reproduced failure on record:
+#   1. _name = 'metax'  → registration + native-backend-first detection
+#      (platform_manager prefers the single non-cuda native backend, so
+#      MetaX machines select this class automatically instead of cuda).
+#   2. _compile_backend initialized to None (tests assert get_compile_backend()
+#      returns None before set_compile_backend()).
+#   3. NVML telemetry (temperature/power_draw/utilization/clock_rate) returns
+#      0 instead of calling torch.cuda.*temperature() etc., which route to
+#      pynvml and raise ModuleNotFoundError on MetaX. Must return 0, NOT None:
+#      StragglerDetector.report (megatron/core/utils.py) does float(temp) on
+#      the results and float(None) raises TypeError. 0 matches the disabled
+#      state's return contract (elapsed() returns 0s when _off).
 
 import os
+import sys
 
 from .platform_base import PlatformBase
 
 try:
-    import torch
+    import torch.cuda
 except ImportError:
     pass
+
+pynvml = None
+try:
+    import pynvml
+    pynvml.nvmlInit()
+except Exception:
+    pynvml = None
 
 
 class PlatformMetax(PlatformBase):
@@ -16,19 +44,17 @@ class PlatformMetax(PlatformBase):
         self._name = 'metax'
         self._compile_backend = None
 
-    # ============================================================
-    #  硬件检测
-    # ============================================================
     def is_available(self):
         try:
             import torch
-            return torch.cuda.is_available() and torch.cuda.device_count() > 0
-        except Exception:
+            # Determine if we are on a GPU or x86 CPU with torch.
+            if torch.cuda.device_count() > 0 and torch.cuda.is_available():  #ignore-cuda
+                return True
+            else:
+                return False
+        except Exception as e:
             return False
 
-    # ============================================================
-    #  设备属性
-    # ============================================================
     def get_device_properties(self, device_index=None):
         return torch.cuda.get_device_properties(device_index)
 
@@ -47,12 +73,8 @@ class PlatformMetax(PlatformBase):
     def handles_memory_backpressure(self):
         return self.is_synchronized_device()
 
-    # ============================================================
-    #  Device APIs
-    # ============================================================
+    # Device APIs
     def device_name(self, device_index=None):
-        # MetaX PyTorch exposes CUDA-compatible device strings.
-        # Native torch APIs do not accept device='metax'.
         if device_index is None:
             return 'cuda'
         return 'cuda:{}'.format(device_index)
@@ -61,14 +83,13 @@ class PlatformMetax(PlatformBase):
         return torch.device('cuda', device_index)
 
     def set_device(self, device_index):
-        return torch.cuda.set_device(device_index)
+        torch.cuda.set_device(device_index)
 
     def current_device(self):
         return torch.cuda.current_device()
 
     def current_device_name(self):
-        # MetaX PyTorch exposes CUDA-compatible device strings.
-        return 'cuda:{}'.format(self.current_device())
+        return 'cuda:{}'.format(torch.cuda.current_device())
 
     def device_count(self):
         return torch.cuda.device_count()
@@ -76,20 +97,20 @@ class PlatformMetax(PlatformBase):
     def synchronize(self, device_index=None):
         return torch.cuda.synchronize(device_index)
 
-    # ============================================================
-    #  RNG APIs
-    # ============================================================
+    # RNG APIs
     def random(self):
         return torch.random
 
     def set_rng_state(self, new_state, device_index=None):
         if device_index is None:
             return torch.cuda.set_rng_state(new_state)
+
         return torch.cuda.set_rng_state(new_state, device_index)
 
     def get_rng_state(self, device=None):
         if device is None:
             return torch.cuda.get_rng_state()
+
         return torch.cuda.get_rng_state(device)
 
     def manual_seed(self, seed):
@@ -105,9 +126,7 @@ class PlatformMetax(PlatformBase):
     def default_generators(self):
         return torch.cuda.default_generators
 
-    # ============================================================
-    #  Stream/Event APIs
-    # ============================================================
+    # Streams/Events
     @property
     def Stream(self):
         return torch.cuda.Stream
@@ -135,9 +154,7 @@ class PlatformMetax(PlatformBase):
     def Event(self):
         return torch.cuda.Event
 
-    # ============================================================
-    #  Memory APIs
-    # ============================================================
+    # Memory management
     def empty_cache(self):
         return torch.cuda.empty_cache()
 
@@ -178,23 +195,50 @@ class PlatformMetax(PlatformBase):
     def total_memory(self, device_index=None):
         return torch.cuda.get_device_properties(device_index).total_memory
 
-    def available_memory(self, device_index=None):
-        return self.total_memory(device_index) - self.memory_allocated(device_index)
+    def _get_nvml_gpu_id(self, torch_gpu_id):
+        """
+        credit: https://discuss.pytorch.org/t/making-pynvml-match-torch-device-ids-cuda-visible-devices/103020
 
-    # ============================================================
-    #  数据类型支持
-    # ============================================================
+        Remap torch device id to nvml device id, respecting CUDA_VISIBLE_DEVICES.
+
+        If the latter isn't set return the same id
+        """
+        # if CUDA_VISIBLE_DEVICES is used automagically remap the id since pynvml ignores this env var
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            ids = list(map(int, os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")))
+            return ids[torch_gpu_id]  # remap
+        else:
+            return torch_gpu_id
+
+    def available_memory(self, device_index=None):
+        if pynvml:
+            if device_index is None:
+                device_index = self.current_device()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self._get_nvml_gpu_id(device_index))
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return info.free
+        else:
+            return self.total_memory(device_index) - self.memory_allocated(device_index)
+
+    # Data types
     def is_bf16_supported(self):
         if not torch.cuda.is_available():
             return False
-        if hasattr(torch.cuda, 'is_bf16_supported'):
-            return torch.cuda.is_bf16_supported()
-        return True
+        return torch.cuda.is_bf16_supported()
 
     def is_fp16_supported(self):
         if not torch.cuda.is_available():
             return False
-        return True
+        # See https://docs.nvidia.com/deeplearning/tensorrt/support-matrix/index.html#hardware-precision-matrix
+        # FP16 on compute capability 6.x is deprecated
+        allow_deprecated_fp16 = os.environ.get('MG_ALLOW_DEPRECATED_FP16', '0') == '1'
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 7:
+            return True
+        elif major == 6 and allow_deprecated_fp16:
+            return True
+        else:
+            return False
 
     def supported_dtypes(self):
         supported_dtypes = [torch.float]
@@ -204,71 +248,83 @@ class PlatformMetax(PlatformBase):
             supported_dtypes.append(torch.bfloat16)
         return supported_dtypes
 
-    # ============================================================
-    #  Misc
-    # ============================================================
+    # Misc
     def amp(self):
         if hasattr(torch.cuda, 'amp'):
             return torch.cuda.amp
         return None
 
     def range(self, msg):
-        pass
+        if hasattr(torch.cuda.nvtx, 'range'):
+            return torch.cuda.nvtx.range(msg)
 
     def range_push(self, msg):
-        pass
+        if hasattr(torch.cuda.nvtx, 'range_push'):
+            return torch.cuda.nvtx.range_push(msg)
 
     def range_pop(self):
-        pass
+        if hasattr(torch.cuda.nvtx, 'range_pop'):
+            return torch.cuda.nvtx.range_pop()
 
     def lazy_call(self, callback):
-        pass
+        return torch.cuda._lazy_call(callback)
 
     def is_triton_supported(self):
-        return False
+        if not self.is_available():
+            return False
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            return True
+        else:
+            return False
 
-    # ============================================================
-    #  Graph operations
-    # ============================================================
+    # Graph operations
     def create_graph(self):
         return torch.cuda.CUDAGraph()
 
     def capture_to_graph(self, graph, pool=None, stream=None):
-        return torch.cuda.graph(graph, pool=pool, stream=stream)
+        return torch.cuda.graph(graph, pool, stream)
 
     def replay_graph(self, graph):
         graph.replay()
+        return
 
-    # ============================================================
-    #  Tensor operations
-    # ============================================================
+    # Tensor operations
+
     @property
     def BFloat16Tensor(self):
         return torch.cuda.BFloat16Tensor
+        # return functools.partial(torch.tensor, dtype=torch.bfloat16, device='cuda')
 
     @property
     def ByteTensor(self):
         return torch.cuda.ByteTensor
+        # return functools.partial(torch.tensor, dtype=torch.uint8, device='cuda')
 
     @property
     def DoubleTensor(self):
         return torch.cuda.DoubleTensor
+        # return functools.partial(torch.tensor, dtype=torch.double, device='cuda')
 
     @property
     def FloatTensor(self):
         return torch.cuda.FloatTensor
+        # return functools.partial(torch.tensor, dtype=torch.float, device='cuda')
 
     @property
     def HalfTensor(self):
         return torch.cuda.HalfTensor
+        # return functools.partial(torch.tensor, dtype=torch.half, device='cuda')
 
     @property
     def IntTensor(self):
         return torch.cuda.IntTensor
+        # return functools.partial(torch.tensor, dtype=torch.int, device='cuda')
 
     @property
     def LongTensor(self):
         return torch.cuda.LongTensor
+        # return functools.partial(torch.tensor, dtype=torch.long, device='cuda')
 
     def pin_memory(self, tensor, align_bytes=1):
         return tensor.pin_memory()
@@ -278,7 +334,10 @@ class PlatformMetax(PlatformBase):
 
     def on_accelerator(self, tensor):
         device_str = str(tensor.device)
-        return device_str.startswith('cuda:')
+        if device_str.startswith('cuda:'):
+            return True
+        else:
+            return False
 
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
@@ -295,16 +354,27 @@ class PlatformMetax(PlatformBase):
         return self._compile_backend
 
     def set_compile_backend(self, backend):
-        self._compile_backend = backend
+        supported_backends = torch._dynamo.list_backends(exclude_tags=())
+        if backend in supported_backends:
+            self._compile_backend = backend
+        else:
+            raise ValueError(
+                f"{backend} not supported by {self.device_name()}. Supported Backends are {supported_backends}")
 
+    # === MetaX delta: NVML telemetry ===
+    # MetaX has no NVML; torch.cuda.temperature() etc. raise ModuleNotFoundError
+    # (pynvml). Return 0 — NOT None — because StragglerDetector.report does
+    # float(temp)/float(power)/... on these results (float(None) raises
+    # TypeError; verified on Qwen3.5-4B vendor 8-GPU training with
+    # --log-straggler). 0 matches the disabled-state contract of elapsed().
     def temperature(self):
-        pass
+        return 0
 
     def power_draw(self):
-        pass
+        return 0
 
     def utilization(self):
-        pass
+        return 0
 
     def clock_rate(self):
-        pass
+        return 0
